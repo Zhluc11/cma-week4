@@ -1,0 +1,307 @@
+---
+title: "Exercises"
+format: html
+---
+
+## Exercise A Segmentation
+The goal is to classify each point of my trajectory as either:
+static = TRUE or static = FLASE (animal is moving) 
+
+### Preprocessing
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(sf)
+
+#import data
+
+raw <- fromJSON("location-history.json", flatten = TRUE)
+
+# preprocessing to convert to movement data
+loc <- raw |>
+  mutate(
+    start_time = ymd_hms(startTime), #convert start-time into read date-time object
+    end_time = ymd_hms(endTime),
+    
+    record_type = case_when(
+      !is.na(activity.distanceMeters) ~ "activity",
+      !is.na(visit.probability) ~ "visit",
+      TRUE ~ "unknown" #If distanceMeters is NOT missing, assign activity,if visit probability exist, assign visit. 
+    ),
+    
+    location = case_when(
+      record_type == "activity" ~ activity.start,
+      record_type == "visit" ~ visit.topCandidate.placeLocation
+    ), # create a location column with activity start coordinate for activity and coordinates of visit if visit
+    
+    lat = as.numeric(str_extract(location, "(?<=geo:)[0-9.\\-]+")), #extract latuitude
+    lon = as.numeric(str_extract(location, "(?<=,)[0-9.\\-]+")), # extract longitude
+    
+    activity_type = activity.topCandidate.type
+  ) |>
+  select(start_time, end_time, record_type, activity_type, lat, lon) |> #keep only useful columns
+  filter(!is.na(lat), !is.na(lon)) |> #remove rows without coordinates
+  arrange(start_time)  #sort by time
+
+```
+
+
+```{r}
+#Convert coordinares to distances in meters
+
+loc_sf <- loc |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) |>
+  st_transform(2056)
+
+# separate coordinates in 2 columns like the Sabi example.
+coords <- st_coordinates(loc_sf)
+
+loc_sf <- loc_sf |>
+  mutate(
+    E = coords[, 1],
+    N = coords[, 2]
+  )
+```
+
+
+### Task 1: Calculate distances
+
+#### Step a) Specify a temporal window v
+
+```{r}
+# we choose 30 minstes before and after each points
+v <- 30
+```
+#### Steb b) measure distance to every point within v
+
+```{r}
+loc_sf <- loc_sf |>
+  rowwise() |> # do the calculation one row at a time
+  mutate(
+    stepMean = mean( #the average distance from the current point to nearby points in time.
+      as.numeric(
+        st_distance(
+          geometry,
+          loc_sf$geometry[
+            abs(as.numeric(difftime(loc_sf$start_time, start_time, units = "mins"))) <= v &
+              abs(as.numeric(difftime(loc_sf$start_time, start_time, units = "mins"))) > 0
+          ]
+        )
+      ),
+      na.rm = TRUE
+    )
+  ) |>
+  ungroup()
+
+summary(loc_sf$stepMean)
+```
+
+### Task 2 Specify and apply threshold d
+
+
+```{r}
+summary(loc_sf$stepMean)
+hist(loc_sf$stepMean)
+boxplot(loc_sf$stepMean)
+
+#use mean of stepmean as threshold 
+d <- mean(loc_sf$stepMean, na.rm = TRUE)
+
+#create the static column 
+
+loc_sf <- loc_sf |>
+  mutate(static = stepMean < d)
+
+
+```
+
+### Task 3  Visualize segmented trajectory
+
+```{r}
+loc_sf |>
+  ggplot(aes(E, N)) +
+  geom_path() +
+  geom_point(aes(colour = static)) +
+  coord_equal() +
+  theme_minimal()
+```
+
+### Task 4  Segment-based analysis
+
+```{r}
+rle_id <- function(vec) {
+  x <- rle(vec)$lengths
+  as.factor(rep(seq_along(x), times = x))
+}
+
+# Create Segement IDs 
+loc_sf <- loc_sf |>
+  mutate(segment_id = rle_id(static))
+
+
+
+#visualise only moving segements
+
+loc_sf |>
+  filter(static == FALSE) |>
+  ggplot(aes(E, N)) +
+  geom_path(aes(colour = segment_id)) +
+  geom_point(aes(colour = segment_id)) +
+  coord_equal() +
+  theme_minimal()
+
+
+#Calculate duration per segment
+segment_summary <- loc_sf |>
+  st_drop_geometry() |>
+  group_by(segment_id, static) |>
+  summarise(
+    start_time = min(start_time),
+    end_time = max(end_time),
+    duration_min = as.numeric(difftime(end_time, start_time, units = "mins")),
+    .groups = "drop"
+  )
+
+segment_summary
+
+#remonve segements with duration < 5 min 
+valid_segments <- segment_summary |>
+  filter(duration_min >= 5)
+
+loc_filtered <- loc_sf |>
+  filter(segment_id %in% valid_segments$segment_id)
+
+# Final plot 
+loc_filtered |>
+  filter(static == FALSE) |>
+  ggplot(aes(E, N)) +
+  geom_path(aes(colour = segment_id)) +
+  geom_point(aes(colour = segment_id)) +
+  coord_equal() +
+  theme_minimal()
+
+
+```
+
+## Exercise B Similarity
+
+```{r}
+library(SimilarityMeasures)
+
+pedestrian <- read_delim("pedestrian.csv")
+names(pedestrian)
+```
+
+### Task 1 similarity measures 
+
+```{r}
+#Visualize all trajectories
+ggplot(pedestrian, aes(E, N, colour = as.factor(TrajID))) +
+  geom_path() +
+  geom_point() +
+  coord_equal() +
+  facet_wrap(~ TrajID, ncol = 3, labeller = label_both)+
+  theme_minimal()
+```
+
+
+### Task 2 Calculate similarity 
+
+```{r}
+#create a matrix per trajectory 
+traj1 <- pedestrian |>
+  filter(TrajID == 1) |>
+  select(E, N) |>
+  as.matrix()
+
+traj2 <- pedestrian |>
+  filter(TrajID == 2) |>
+  select(E, N) |>
+  as.matrix()
+
+traj3 <- pedestrian |>
+  filter(TrajID == 3) |>
+  select(E, N) |>
+  as.matrix()
+
+traj4 <- pedestrian |>
+  filter(TrajID == 4) |>
+  select(E, N) |>
+  as.matrix()
+
+traj5 <- pedestrian |>
+  filter(TrajID == 5) |>
+  select(E, N) |>
+  as.matrix()
+
+traj6 <- pedestrian |>
+  filter(TrajID == 6) |>
+  select(E, N) |>
+  as.matrix()
+
+#Calculate similarity measures
+
+similarity_results <- tibble(
+  comparison_trajectory = c(2, 3, 4, 5, 6),
+  
+  DTW = c(
+    DTW(traj1, traj2),
+    DTW(traj1, traj3),
+    DTW(traj1, traj4),
+    DTW(traj1, traj5),
+    DTW(traj1, traj6)
+  ),
+  
+  EditDist = c(
+    EditDist(traj1, traj2),
+    EditDist(traj1, traj3),
+    EditDist(traj1, traj4),
+    EditDist(traj1, traj5),
+    EditDist(traj1, traj6)
+  ),
+  
+  Frechet = c(
+    Frechet(traj1, traj2),
+    Frechet(traj1, traj3),
+    Frechet(traj1, traj4),
+    Frechet(traj1, traj5),
+    Frechet(traj1, traj6)
+  ),
+  
+  LCSS = c(
+    LCSS(traj1, traj2, pointSpacing = 10, pointDistance = 10, errorMarg = 10),
+    LCSS(traj1, traj3, pointSpacing = 10, pointDistance = 10, errorMarg = 10),
+    LCSS(traj1, traj4, pointSpacing = 10, pointDistance = 10, errorMarg = 10),
+    LCSS(traj1, traj5, pointSpacing = 10, pointDistance = 10, errorMarg = 10),
+    LCSS(traj1, traj6, pointSpacing = 10, pointDistance = 10, errorMarg = 10)
+  )
+)
+
+similarity_results
+
+# in long format 
+similarity_long <- similarity_results |>
+  pivot_longer(
+    cols = c(DTW, EditDist, Frechet, LCSS),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+#plot 
+ggplot(similarity_long, aes(x = factor(comparison_trajectory), y = value, fill = factor(comparison_trajectory))) +
+  geom_col() +
+  facet_wrap(~ measure, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Computed similarities using different measures\nbetween trajectory 1 to all other trajectories",
+    x = "Comparison trajectory",
+    y = "Value"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none"
+  )
+
+```
+
